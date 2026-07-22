@@ -25,7 +25,7 @@ import (
 )
 
 type CachedLIDMap struct {
-	db *dbutil.Database
+	db *storeDB
 
 	pnToLIDCache map[string]string
 	lidToPNCache map[string]string
@@ -36,6 +36,10 @@ type CachedLIDMap struct {
 var _ store.LIDStore = (*CachedLIDMap)(nil)
 
 func NewCachedLIDMap(db *dbutil.Database) *CachedLIDMap {
+	return newCachedLIDMap(newStoreDB(db))
+}
+
+func newCachedLIDMap(db *storeDB) *CachedLIDMap {
 	return &CachedLIDMap{
 		db: db,
 

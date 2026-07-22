@@ -15,4 +15,8 @@ import (
 //go:embed *.sql
 var upgrades embed.FS
 
+// FS exposes the embedded upgrade files so schema-scoped stores can apply
+// them with qualified table names instead of dbutil's upgrade runner.
+var FS = upgrades
+
 var Table = dbutil.BuildUpgradeTable().WithFS(upgrades).Finish()

@@ -27,7 +27,7 @@ import (
 
 // Container is a wrapper for a SQL database that can contain multiple whatsmeow sessions.
 type Container struct {
-	db     *dbutil.Database
+	db     *storeDB
 	log    waLog.Logger
 	LIDMap *CachedLIDMap
 }
@@ -87,18 +87,50 @@ func NewWithDB(db *sql.DB, dialect string, log waLog.Logger) *Container {
 }
 
 func NewWithWrappedDB(wrapped *dbutil.Database, log waLog.Logger) *Container {
+	return newWithStoreDB(newStoreDB(wrapped), log)
+}
+
+// NewWithSchema wraps a shared Postgres connection pool in a Container whose
+// tables all live in the given schema. Unlike New/NewWithDB, the schema name
+// is written directly into every query ("schema".whatsmeow_device), so any
+// number of Containers can share the same *sql.DB without search_path tricks.
+//
+// The schema is created if missing and upgraded to the latest version.
+// Closing the Container does NOT close the shared *sql.DB; that stays owned
+// by the caller.
+func NewWithSchema(ctx context.Context, db *sql.DB, schema string, log waLog.Logger) (*Container, error) {
+	if schema == "" {
+		return nil, fmt.Errorf("schema name must not be empty")
+	}
+	wrapped, err := dbutil.NewWithDB(db, "postgres")
+	if err != nil {
+		return nil, err
+	}
+	wrapped.UpgradeTable = upgrades.Table
+	wrapped.VersionTable = "whatsmeow_version"
+	container := newWithStoreDB(newSchemaStoreDB(wrapped, schema), log)
+	if err = container.upgradeSchema(ctx); err != nil {
+		return nil, fmt.Errorf("failed to upgrade schema %s: %w", schema, err)
+	}
+	return container, nil
+}
+
+func newWithStoreDB(db *storeDB, log waLog.Logger) *Container {
 	if log == nil {
 		log = waLog.Noop
 	}
 	return &Container{
-		db:     wrapped,
+		db:     db,
 		log:    log,
-		LIDMap: NewCachedLIDMap(wrapped),
+		LIDMap: newCachedLIDMap(db),
 	}
 }
 
 // Upgrade upgrades the database from the current to the latest version available.
 func (c *Container) Upgrade(ctx context.Context) error {
+	if c.db.schema != "" {
+		return c.upgradeSchema(ctx)
+	}
 	if c.db.Dialect == dbutil.SQLite {
 		var foreignKeysEnabled bool
 		err := c.db.QueryRow(ctx, "PRAGMA foreign_keys").Scan(&foreignKeysEnabled)
@@ -225,9 +257,10 @@ func (c *Container) NewDevice() *store.Device {
 // ErrDeviceIDMustBeSet is the error returned by PutDevice if you try to save a device before knowing its JID.
 var ErrDeviceIDMustBeSet = errors.New("device JID must be known before accessing database")
 
-// Close will close the container's database
+// Close will close the container's database, unless the container was built
+// with NewWithSchema over a shared pool owned by the caller.
 func (c *Container) Close() error {
-	if c != nil && c.db != nil {
+	if c != nil && c.db != nil && !c.db.sharedPool {
 		return c.db.Close()
 	}
 	return nil
