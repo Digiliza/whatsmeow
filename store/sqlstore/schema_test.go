@@ -9,6 +9,7 @@ package sqlstore
 import (
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"go.mau.fi/util/dbutil"
 )
@@ -92,6 +93,43 @@ func TestRewriteAppliesEmbeddedUpgrades(t *testing.T) {
 	}
 	if !strings.Contains(rewritten, `CREATE TABLE "s1".whatsmeow_device`) {
 		t.Errorf("device table not qualified:\n%s", rewritten)
+	}
+}
+
+func TestRewriteMemoizesQueries(t *testing.T) {
+	db := newTestSchemaDB(t, "session_abc")
+	query := `SELECT identity FROM whatsmeow_identity_keys WHERE our_jid=$1`
+	first := db.rewrite(query)
+	cached, ok := db.rewriteCache.Load(query)
+	if !ok {
+		t.Fatal("rewrite result was not cached")
+	}
+	if cached.(string) != first || db.rewrite(query) != first {
+		t.Fatalf("cached rewrite differs from fresh rewrite: %q", first)
+	}
+}
+
+func TestLoadSchemaUpgradesRejectsUnsupportedDbutilFeatures(t *testing.T) {
+	valid := "-- v1: Base\nCREATE TABLE whatsmeow_device (jid TEXT PRIMARY KEY);\n"
+	cases := []struct{ name, file, content string }{
+		{"transaction marker", "01-base.sql", "-- v1: Base\n-- transaction: off\nCREATE INDEX foo ON whatsmeow_device (jid);\n"},
+		{"dialect filter", "01-base.sql", "-- v1: Base\n-- only: sqlite\nPRAGMA foo;\n"},
+		{"split postgres file", "01-base.postgres.sql", valid},
+		{"split sqlite file", "01-base.sqlite.sql", valid},
+	}
+	for _, tc := range cases {
+		fsys := fstest.MapFS{tc.file: &fstest.MapFile{Data: []byte(tc.content)}}
+		if _, _, err := loadSchemaUpgradesFS(fsys); err == nil {
+			t.Errorf("%s: expected loadSchemaUpgradesFS to fail", tc.name)
+		} else if !strings.Contains(err.Error(), "not supported by the schema-scoped runner") {
+			t.Errorf("%s: unexpected error: %v", tc.name, err)
+		}
+	}
+	// A plain file must keep loading.
+	fsys := fstest.MapFS{"01-base.sql": &fstest.MapFile{Data: []byte(valid)}}
+	table, latest, err := loadSchemaUpgradesFS(fsys)
+	if err != nil || latest != 1 || len(table) != 1 {
+		t.Fatalf("plain upgrade file rejected: %v (latest=%d, entries=%d)", err, latest, len(table))
 	}
 }
 

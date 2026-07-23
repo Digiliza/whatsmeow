@@ -11,9 +11,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"go.mau.fi/util/dbutil"
 
@@ -36,7 +39,20 @@ type storeDB struct {
 	// caller and shared between containers, so Container.Close must not
 	// close it.
 	sharedPool bool
+
+	// rewriteCache memoizes rewritten queries: rewrite runs on every query
+	// and almost all of them are package-level constants, so paying the
+	// regexp cost once per distinct query keeps it off the hot path (dbutil
+	// avoids regexps there for the same reason). rewriteCacheLen caps the
+	// cache so dynamically-built queries (variable placeholder lists) cannot
+	// grow it without bound.
+	rewriteCache    sync.Map
+	rewriteCacheLen atomic.Int64
 }
+
+// rewriteCacheLimit is far above the ~70 distinct query constants in this
+// package; the cap only guards against unbounded dynamically-built queries.
+const rewriteCacheLimit = 1024
 
 func newStoreDB(db *dbutil.Database) *storeDB {
 	return &storeDB{Database: db}
@@ -69,10 +85,17 @@ func (d *storeDB) rewrite(query string) string {
 	if d.schema == "" {
 		return query
 	}
-	return tableRefRegex.ReplaceAllStringFunc(query, func(match string) string {
+	if cached, ok := d.rewriteCache.Load(query); ok {
+		return cached.(string)
+	}
+	rewritten := tableRefRegex.ReplaceAllStringFunc(query, func(match string) string {
 		groups := tableRefRegex.FindStringSubmatch(match)
 		return groups[1] + groups[2] + d.quotedSchema + "." + groups[3]
 	})
+	if d.rewriteCacheLen.Add(1) <= rewriteCacheLimit {
+		d.rewriteCache.Store(query, rewritten)
+	}
+	return rewritten
 }
 
 func (d *storeDB) Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
@@ -89,18 +112,38 @@ func (d *storeDB) QueryRow(ctx context.Context, query string, args ...any) *sql.
 
 var upgradeHeaderRegex = regexp.MustCompile(`^-- (?:v(\d+) -> )?v(\d+)(?: \(compatible with v(\d+)\+\))?:`)
 
+// Markers interpreted by dbutil's upgrade runner but NOT by the schema-scoped
+// runner below. If an upstream sync introduces one of these, applying the file
+// verbatim would be silently wrong (e.g. an upgrade flagged "transaction: off"
+// running inside a transaction, or SQLite-only lines executed on Postgres), so
+// loading fails loudly instead.
+var (
+	unsupportedMarkerRegex   = regexp.MustCompile(`(?m)^\s*-- (transaction|only):`)
+	splitUpgradeFileRegex    = regexp.MustCompile(`\.(postgres|sqlite)\.sql$`)
+	errUnsupportedUpgradeFmt = "upgrade %s uses dbutil feature %q not supported by the schema-scoped runner; extend upgradeSchema before syncing this upstream change"
+)
+
 type schemaUpgrade struct {
 	to     int
 	compat int
 	sql    string
 }
 
+type upgradeFS interface {
+	fs.ReadDirFS
+	fs.ReadFileFS
+}
+
 // loadSchemaUpgrades parses the embedded upgrade files into a table indexed
 // by source version, mirroring dbutil's upgrade table semantics: a file with
 // a "-- vN -> vM" header upgrades from N to M, and a file with just "-- vM"
 // upgrades from M-1 to M. Gaps behave as no-op upgrades.
-func loadSchemaUpgrades() (table map[int]schemaUpgrade, latest int, err error) {
-	entries, err := upgrades.FS.ReadDir(".")
+func loadSchemaUpgrades() (map[int]schemaUpgrade, int, error) {
+	return loadSchemaUpgradesFS(upgrades.FS)
+}
+
+func loadSchemaUpgradesFS(fsys upgradeFS) (table map[int]schemaUpgrade, latest int, err error) {
+	entries, err := fsys.ReadDir(".")
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to list upgrade files: %w", err)
 	}
@@ -109,9 +152,15 @@ func loadSchemaUpgrades() (table map[int]schemaUpgrade, latest int, err error) {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
 			continue
 		}
-		data, err := upgrades.FS.ReadFile(entry.Name())
+		if splitUpgradeFileRegex.MatchString(entry.Name()) {
+			return nil, 0, fmt.Errorf(errUnsupportedUpgradeFmt, entry.Name(), "split dialect files")
+		}
+		data, err := fsys.ReadFile(entry.Name())
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to read upgrade %s: %w", entry.Name(), err)
+		}
+		if marker := unsupportedMarkerRegex.Find(data); marker != nil {
+			return nil, 0, fmt.Errorf(errUnsupportedUpgradeFmt, entry.Name(), strings.TrimSpace(string(marker)))
 		}
 		header, _, _ := strings.Cut(string(data), "\n")
 		match := upgradeHeaderRegex.FindStringSubmatch(header)
@@ -136,6 +185,14 @@ func loadSchemaUpgrades() (table map[int]schemaUpgrade, latest int, err error) {
 		}
 	}
 	return table, latest, nil
+}
+
+func init() {
+	// Catch unsupported upstream upgrade formats at process start (and in any
+	// test run) rather than on the first session open in production.
+	if _, _, err := loadSchemaUpgrades(); err != nil {
+		panic(err)
+	}
 }
 
 // upgradeSchema is the Postgres-only, schema-scoped counterpart of
