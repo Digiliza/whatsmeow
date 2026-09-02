@@ -7,6 +7,7 @@
 package whatsmeow
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -37,15 +38,12 @@ type ReqCreateGroup struct {
 	Name string
 	// You don't need to include your own JID in the participants array, the WhatsApp servers will add it implicitly.
 	Participants []types.JID
-	// A create key can be provided to deduplicate the group create notification that will be triggered
-	// when the group is created. If provided, the JoinedGroup event will contain the same key.
-	// Deprecated: It seems like WhatsApp no longer sends this.
-	CreateKey types.MessageID
 
 	types.GroupEphemeral
 	types.GroupAnnounce
 	types.GroupLocked
 	types.GroupMembershipApprovalMode
+	MemberAddMode types.GroupMemberAddMode
 	// Set IsParent to true to create a community instead of a normal group.
 	// When creating a community, the linked announcement group will be created automatically by the server.
 	types.GroupParent
@@ -58,6 +56,11 @@ type ReqCreateGroup struct {
 // See ReqCreateGroup for parameters.
 func (cli *Client) CreateGroup(ctx context.Context, req ReqCreateGroup) (*types.GroupInfo, error) {
 	participantNodes := make([]waBinary.Node, len(req.Participants), len(req.Participants)+1)
+	// TODO member_share_group_history_mode
+	participantNodes = append(participantNodes, waBinary.Node{
+		Tag:     "member_add_mode",
+		Content: string(cmp.Or(req.MemberAddMode, types.GroupMemberAddModeAllMember)),
+	})
 	for i, participant := range req.Participants {
 		participant = participant.ToNonAD()
 		var participantPN types.JID
@@ -116,24 +119,26 @@ func (cli *Client) CreateGroup(ctx context.Context, req ReqCreateGroup) (*types.
 				"trigger":    "1", // TODO what's this?
 			},
 		})
-	}
-	if req.IsJoinApprovalRequired {
+	} else {
 		participantNodes = append(participantNodes, waBinary.Node{
-			Tag: "membership_approval_mode",
-			Content: []waBinary.Node{{
-				Tag:   "group_join",
-				Attrs: waBinary.Attrs{"state": "on"},
-			}},
+			Tag:   "ephemeral",
+			Attrs: waBinary.Attrs{"expiration": 0},
 		})
 	}
-	createAttrs := waBinary.Attrs{
-		"subject": req.Name,
+	approvalState := "off"
+	if req.IsJoinApprovalRequired {
+		approvalState = "on"
 	}
+	participantNodes = append(participantNodes, waBinary.Node{
+		Tag: "membership_approval_mode",
+		Content: []waBinary.Node{{
+			Tag:   "group_join",
+			Attrs: waBinary.Attrs{"state": approvalState},
+		}},
+	})
+	createAttrs := waBinary.Attrs{}
 	if req.Name != "" {
 		createAttrs["subject"] = req.Name
-	}
-	if req.CreateKey != "" {
-		createAttrs["create_key"] = strings.TrimPrefix(req.CreateKey, "3EB0")
 	}
 	resp, err := cli.sendGroupIQ(ctx, iqSet, types.GroupServerJID, waBinary.Node{
 		Tag:     "create",
@@ -547,8 +552,15 @@ func (cli *Client) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, err
 	}
 	children := groups.GetChildren()
 	infos := make([]*types.GroupInfo, 0, len(children))
+	var truncated []*types.GroupInfo
 	var allLIDPairs []store.LIDMapping
 	var allRedactedPhones []store.RedactedPhoneEntry
+	collect := func(parsed *types.GroupInfo) {
+		lidPairs, redactedPhones := cli.cacheGroupInfo(parsed, true)
+		allLIDPairs = append(allLIDPairs, lidPairs...)
+		allRedactedPhones = append(allRedactedPhones, redactedPhones...)
+		infos = append(infos, parsed)
+	}
 	for _, child := range children {
 		if child.Tag != "group" {
 			cli.Log.Debugf("Unexpected child in group list response: %s", &child)
@@ -558,10 +570,26 @@ func (cli *Client) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, err
 		if parseErr != nil {
 			cli.Log.Warnf("Error parsing group %s: %v", parsed.JID, parseErr)
 		}
-		lidPairs, redactedPhones := cli.cacheGroupInfo(parsed, true)
-		allLIDPairs = append(allLIDPairs, lidPairs...)
-		allRedactedPhones = append(allRedactedPhones, redactedPhones...)
-		infos = append(infos, parsed)
+		if child.AttrGetter().OptionalString("truncated") == "true" {
+			// Stub with only id and size, the full info is fetched below with a batched query
+			truncated = append(truncated, parsed)
+			continue
+		}
+		collect(parsed)
+	}
+	for _, batch := range chunkGroupsBySize(truncated) {
+		full, batchErr := cli.getGroupInfoBatch(ctx, batch)
+		if batchErr != nil {
+			cli.Log.Warnf("Failed to get full info for %d truncated groups: %v", len(batch), batchErr)
+			// Keep the stubs so the group list stays complete
+			for _, parsed := range batch {
+				collect(parsed)
+			}
+			continue
+		}
+		for _, parsed := range full {
+			collect(parsed)
+		}
 	}
 	err = cli.Store.LIDs.PutManyLIDMappings(ctx, allLIDPairs)
 	if err != nil {
@@ -570,6 +598,64 @@ func (cli *Client) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, err
 	err = cli.Store.Contacts.PutManyRedactedPhones(ctx, allRedactedPhones)
 	if err != nil {
 		cli.Log.Warnf("Failed to store redacted phones from joined groups: %v", err)
+	}
+	return infos, nil
+}
+
+// WhatsApp Web chunks batched group info queries by cumulative group size with this limit.
+const groupInfoBatchMaxSize = 50_000
+
+func chunkGroupsBySize(groups []*types.GroupInfo) [][]*types.GroupInfo {
+	var batches [][]*types.GroupInfo
+	var batch []*types.GroupInfo
+	size := 0
+	for _, group := range groups {
+		if len(batch) > 0 && size+group.ParticipantCount > groupInfoBatchMaxSize {
+			batches = append(batches, batch)
+			batch = nil
+			size = 0
+		}
+		batch = append(batch, group)
+		size += group.ParticipantCount
+	}
+	if len(batch) > 0 {
+		batches = append(batches, batch)
+	}
+	return batches
+}
+
+// getGroupInfoBatch requests full info for multiple groups at once, like WhatsApp Web does for
+// truncated entries in the participating groups response.
+func (cli *Client) getGroupInfoBatch(ctx context.Context, groups []*types.GroupInfo) ([]*types.GroupInfo, error) {
+	content := make([]waBinary.Node, len(groups))
+	for i, group := range groups {
+		content[i] = waBinary.Node{Tag: "group", Attrs: waBinary.Attrs{"jid": group.JID}}
+	}
+	resp, err := cli.sendGroupIQ(ctx, iqGet, types.GroupServerJID, waBinary.Node{
+		Tag:     "query",
+		Attrs:   waBinary.Attrs{"context": "get_participating_groups_paginated"},
+		Content: content,
+	})
+	if err != nil {
+		return nil, err
+	}
+	groupsNode, ok := resp.GetOptionalChildByTag("groups")
+	if !ok {
+		return nil, &ElementMissingError{Tag: "groups", In: "response to batch group info query"}
+	}
+	infos := make([]*types.GroupInfo, 0, len(groups))
+	for _, child := range groupsNode.GetChildren() {
+		if child.Tag != "group" {
+			cli.Log.Debugf("Unexpected child in batch group info response: %s", &child)
+			continue
+		}
+		parsed, parseErr := cli.parseGroupNode(&child)
+		if parseErr != nil {
+			// Forbidden / not-exist entries don't have full group info
+			cli.Log.Debugf("Skipping group in batch group info response: %v", parseErr)
+			continue
+		}
+		infos = append(infos, parsed)
 	}
 	return infos, nil
 }
@@ -985,8 +1071,13 @@ func (cli *Client) parseGroupChange(node *waBinary.Node) (*events.GroupInfo, []s
 				return nil, nil, fmt.Errorf("failed to parse group unlink node in group change: %w", err)
 			}
 		case "membership_approval_mode":
+			// The change carries <group_join state="on|off"/> - the mode may be turned off too
+			state := true
+			if groupJoin, ok := child.GetOptionalChildByTag("group_join"); ok {
+				state = groupJoin.AttrGetter().OptionalString("state") != "off"
+			}
 			evt.MembershipApprovalMode = &types.GroupMembershipApprovalMode{
-				IsJoinApprovalRequired: true,
+				IsJoinApprovalRequired: state,
 			}
 		case "suspended":
 			evt.Suspended = true

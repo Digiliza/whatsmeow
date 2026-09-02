@@ -349,8 +349,13 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		} else {
 			cli.Log.Warnf("No LID found for %s", info.Sender)
 		}
+	} else if info.Sender.Server == types.HiddenUserServer && !info.Sender.IsBot() &&
+		info.SenderAlt.Server == types.DefaultUserServer {
+		// lid-addressed group: participant_pn carries the phone number. Migrate any pre-cutover
+		// PN-keyed sessions/sender keys so they aren't orphaned under the PN signal address.
+		cli.migrateSessionStore(ctx, info.SenderAlt, info.Sender)
 	}
-	var recognizedStanza, protobufFailed, dispatchedNew bool
+	var recognizedStanza, protobufFailed, dispatchedNew, freshDirectDecrypt, retryRequested bool
 	for _, child := range children {
 		if child.Tag != "enc" {
 			continue
@@ -400,10 +405,27 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			continue
 		}
 
-		if errors.Is(err, EventAlreadyProcessed) {
+		if errors.Is(err, ErrEventAlreadyProcessed) {
 			cli.Log.Debugf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
 			continue
 		} else if errors.Is(err, signalerror.ErrOldCounter) {
+			if encType == "skmsg" && freshDirectDecrypt && !retryRequested {
+				// The direct sibling in this stanza just installed a fresh SKDM that seeded the sender-key
+				// chain past this skmsg's iteration. The content key below the seed is underivable, so this
+				// is not a re-delivery dedup: ask the sender to re-encrypt via a retry receipt.
+				cli.Log.Warnf("Old counter for group message %s from %s right after fresh sender key, requesting retry: %v", info.ID, info.SourceString(), err)
+				retryRequested = true
+				if cli.SynchronousAck {
+					cli.sendRetryReceipt(ctx, node, info, false)
+				} else {
+					go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, false)
+				}
+				cli.dispatchEvent(&events.UndecryptableMessage{
+					Info:            *info,
+					DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+				})
+				continue
+			}
 			cli.Log.Warnf("Ignoring message %s from %s: %v", info.ID, info.SourceString(), err)
 			continue
 		} else if err != nil {
@@ -416,25 +438,37 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 				cli.backgroundIfAsyncAck(func() {
 					cli.sendAck(ctx, node, NackMissingMessageSecret)
 				})
-			} else if cli.SynchronousAck {
-				cli.sendRetryReceipt(ctx, node, info, isUnavailable)
-				// TODO this probably isn't supposed to ack
-				cli.sendAck(ctx, node, 0)
-			} else {
-				go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
-				go cli.sendAck(ctx, node, 0)
+				cli.dispatchEvent(&events.UndecryptableMessage{
+					Info:            *info,
+					IsUnavailable:   isUnavailable,
+					DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+				})
+				return
 			}
-			cli.dispatchEvent(&events.UndecryptableMessage{
-				Info:            *info,
-				IsUnavailable:   isUnavailable,
-				DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
-			})
-			return
+			// Keep going so a pkmsg after a failed skmsg still installs its SKDM; the plain ack for the
+			// stanza is emitted by the decideAck block below (retryRequested -> ackPlain).
+			if !retryRequested {
+				retryRequested = true
+				if cli.SynchronousAck {
+					cli.sendRetryReceipt(ctx, node, info, isUnavailable)
+				} else {
+					go cli.sendRetryReceipt(context.WithoutCancel(ctx), node, info, isUnavailable)
+				}
+				cli.dispatchEvent(&events.UndecryptableMessage{
+					Info:            *info,
+					IsUnavailable:   isUnavailable,
+					DecryptFailMode: events.DecryptFailMode(ag.OptionalString("decrypt-fail")),
+				})
+			}
+			continue
 		}
 		// A child decrypted cleanly: this delivery carries at least one genuinely
 		// new message (or one whose handler will run). Reaching here means the
 		// EventAlreadyProcessed / ErrOldCounter continues above did not apply.
 		dispatchedNew = true
+		if encType == "pkmsg" || encType == "msg" {
+			freshDirectDecrypt = true
+		}
 		retryCount := ag.OptionalInt("count")
 		cli.cancelDelayedRequestFromPhone(info.ID)
 
@@ -486,7 +520,7 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 		}
 	}
 	cli.backgroundIfAsyncAck(func() {
-		switch decideAck(recognizedStanza, protobufFailed, dispatchedNew) {
+		switch decideAck(recognizedStanza, protobufFailed, dispatchedNew, retryRequested) {
 		case ackUnrecognized:
 			cli.sendAck(ctx, node, NackUnrecognizedStanza)
 		case ackInvalidProto:
@@ -502,7 +536,6 @@ func (cli *Client) decryptMessages(ctx context.Context, info *types.MessageInfo,
 			cli.sendMessageReceipt(ctx, info, node)
 		}
 	})
-	return
 }
 
 // ackKind selects how decryptMessages acknowledges a recognized message node.
@@ -520,12 +553,17 @@ const (
 // nothing new was dispatched (every child was already processed / an old-counter
 // replay), it returns ackPlain so we send a benign ack instead of a media
 // receipt the server would reject — breaking the offline-queue poison loop.
-func decideAck(recognizedStanza, protobufFailed, dispatchedNew bool) ackKind {
+// When a retry receipt already asked the sender to re-encrypt a failed child,
+// claiming delivery would be a lie, but the stanza must still be acked so the
+// server advances its cursor — also ackPlain.
+func decideAck(recognizedStanza, protobufFailed, dispatchedNew, retryRequested bool) ackKind {
 	switch {
 	case !recognizedStanza:
 		return ackUnrecognized
 	case protobufFailed:
 		return ackInvalidProto
+	case retryRequested:
+		return ackPlain
 	case !dispatchedNew:
 		return ackPlain
 	default:
@@ -546,7 +584,10 @@ func (cli *Client) clearUntrustedIdentity(ctx context.Context, target types.JID)
 	return nil
 }
 
-var EventAlreadyProcessed = errors.New("event was already processed")
+var ErrEventAlreadyProcessed = errors.New("event was already processed")
+
+// Deprecated: use ErrEventAlreadyProcessed
+var EventAlreadyProcessed = ErrEventAlreadyProcessed
 
 func (cli *Client) bufferedDecrypt(
 	ctx context.Context,
@@ -578,7 +619,7 @@ func (cli *Client) bufferedDecrypt(
 				Hex("ciphertext_hash", ciphertextHash[:]).
 				Time("insertion_time", buf.InsertTime).
 				Msg("Returning event already processed error")
-			err = fmt.Errorf("%w at %s", EventAlreadyProcessed, buf.InsertTime.String())
+			err = fmt.Errorf("%w at %s", ErrEventAlreadyProcessed, buf.InsertTime.String())
 			return
 		}
 		zerolog.Ctx(ctx).Debug().
@@ -753,7 +794,7 @@ func (cli *Client) handleHistorySyncNotificationLoop() {
 			if err != nil {
 				cli.Log.Errorf("Failed to download history sync: %v", err)
 			} else {
-				cli.dispatchEvent(&events.HistorySync{Data: blob})
+				cli.dispatchEvent(&events.HistorySync{Data: blob, Notification: notif})
 				err = cli.DeleteMedia(ctx, MediaHistory, notif.GetDirectPath(), notif.GetFileEncSHA256(), notif.GetEncHandle())
 				if err != nil {
 					cli.Log.Warnf("Failed to delete history sync media from server: %v", err)
@@ -792,7 +833,7 @@ func (cli *Client) SendHistorySyncServerErrorReceipt(ctx context.Context, msgID 
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to send history sync server-error receipt: %w", err)
+		return fmt.Errorf("failed to send history sync server-error receipt: %w", err)
 	}
 	return nil
 }
@@ -832,6 +873,9 @@ func (cli *Client) DownloadHistorySync(ctx context.Context, notif *waE2E.History
 		}
 		if historySync.GlobalSettings != nil {
 			cli.storeGlobalSettings(ctx, historySync.GlobalSettings)
+		}
+		if historySync.CompanionMetaNonce != nil {
+			cli.storeCompanionMetaNonce(ctx, historySync.GetCompanionMetaNonce())
 		}
 	}
 	if synchronousStorage {
@@ -1002,15 +1046,20 @@ func (cli *Client) storeHistoricalMessageSecrets(ctx context.Context, conversati
 		if chatJID.IsEmpty() {
 			continue
 		}
-		var chatPN types.JID
-		if chatJID.Server == types.DefaultUserServer {
-			chatPN = chatJID
-		} else if chatJID.Server == types.HiddenUserServer {
-			chatPN, _ = cli.Store.LIDs.GetPNForLID(ctx, chatJID)
+		var userJID types.JID
+		if chatJID.Server == types.HiddenUserServer {
+			userJID = chatJID
+		} else if chatJID.Server == types.DefaultUserServer {
+			userJID, _ = cli.Store.LIDs.GetLIDForPN(ctx, chatJID)
+			if userJID.IsEmpty() {
+				// Privacy token queries will check both LIDs and phone numbers, so while we prefer storing with LIDs,
+				// it's still better to store with the phone number than not at all.
+				userJID = chatJID
+			}
 		}
-		if !chatPN.IsEmpty() && conv.GetTcToken() != nil {
+		if !userJID.IsEmpty() && conv.GetTcToken() != nil {
 			privacyTokens = append(privacyTokens, store.PrivacyToken{
-				User:            chatPN,
+				User:            userJID,
 				Token:           conv.GetTcToken(),
 				Timestamp:       time.Unix(int64(conv.GetTcTokenTimestamp()), 0),
 				SenderTimestamp: time.Unix(int64(conv.GetTcTokenSenderTimestamp()), 0),
@@ -1112,6 +1161,20 @@ func (cli *Client) storeGlobalSettings(ctx context.Context, settings *waHistoryS
 			zerolog.Ctx(ctx).Debug().
 				Int64("lid_migration_timestamp", cli.Store.LIDMigrationTimestamp).
 				Msg("Saved chat DB LID migration timestamp")
+		}
+	}
+}
+
+func (cli *Client) storeCompanionMetaNonce(ctx context.Context, nonce string) {
+	if nonce != "" && nonce != cli.Store.CompanionMetaNonce {
+		cli.Store.CompanionMetaNonce = nonce
+		err := cli.Store.Save(ctx)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).
+				Msg("Failed to save companion meta nonce")
+		} else {
+			zerolog.Ctx(ctx).Debug().
+				Msg("Saved companion meta nonce")
 		}
 	}
 }
